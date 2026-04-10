@@ -192,13 +192,12 @@ def fetch_close(ticker: str) -> float | None:
     end   = datetime.now(timezone.utc)
     start = end - timedelta(days=7)
     try:
-        df = yf.download(
+           df = yf.download(
             ticker,
             start=start,
             end=end,
             auto_adjust=True,
             progress=False,
-            show_errors=False,
         )
         if df.empty:
             return None
