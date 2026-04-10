@@ -3,7 +3,7 @@ closing_prices.py
 Inscrit chaque jour les prix de clôture Yahoo Finance dans la feuille 'Freezed prices'.
 
 Structure de la feuille :
-  - Tickers  : ligne 4,  colonnes C→  (C4, D4, E4 …)
+  - Tickers  : ligne 3,  colonnes C→  (C3, D3, E3 …)
   - Dates    : colonne B, lignes 6→  (B6, B7, B8 …)
   - Prix     : cellule à l'intersection (ligne de la date, colonne du ticker)
 
@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 PRICES_SHEET    = "Freezed prices"
 EQUITIES_SHEET  = "Equities"
-TICKER_ROW      = 4          # ligne où sont les tickers (C4, D4, E4 …)
+TICKER_ROW      = 3          # ligne où sont les tickers (C4, D4, E4 …)
 TICKER_COL_START = 3         # colonne C = index 3 (1-based)
 DATE_COL        = 2          # colonne B = index 2 (1-based)
 DATE_ROW_START  = 6          # première date en B6
