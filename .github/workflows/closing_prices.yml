@@ -1,0 +1,32 @@
+name: Closing Prices
+
+on:
+  schedule:
+    # 21h UTC = 23h Paris (été) / 22h Paris (hiver) — après la clôture de toutes les places
+    - cron: "0 21 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  run:
+    name: Fetch & write closing prices
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run closing prices tracker
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SHEET_IDS: ${{ secrets.SHEET_IDS }}
+        run: python closing_prices.py
