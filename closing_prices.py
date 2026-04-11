@@ -4,11 +4,13 @@ Inscrit chaque jour les prix de clôture Yahoo Finance dans 'Freezed prices'.
 
 Structure de la feuille :
   - Tickers Yahoo  : ligne 3, colonnes C→  (C3, D3, E3 …)
+  - Tickers Google : ligne 4, colonnes C→  (C4, D4, E4 …)
   - Dates          : colonne B, lignes 6→  (B6 = 17/05/2021, format DD/MM/YYYY)
   - Prix           : intersection (ligne de la date du jour, colonne du ticker)
 
-Filtre : seuls les tickers présents dans Equities!E7:E sont traités.
-Ces tickers sont au format Google Finance et convertis en Yahoo avant comparaison.
+Filtre : seuls les tickers dont le ticker Google (ligne 4) est présent
+dans Equities!E7:E sont traités. La conversion Google→Yahoo est supprimée :
+on compare directement les valeurs brutes.
 
 Secrets GitHub requis :
   GOOGLE_CREDENTIALS  — contenu du fichier JSON du compte de service
@@ -29,65 +31,19 @@ log = logging.getLogger(__name__)
 
 # ── Constantes ───────────────────────────────────────────────────────────────
 
-PRICES_SHEET     = "Freezed prices"
-EQUITIES_SHEET   = "Equities"
-TICKER_ROW       = 3       # ligne des tickers Yahoo (C3, D3, E3 …)
-TICKER_COL_START = 3       # colonne C = index 3 (1-based)
-DATE_COL         = 2       # colonne B
-DATE_ROW_START   = 6       # première date en B6
-EQUITIES_RANGE   = "E7:E"  # tickers actifs au format Google Finance
+PRICES_SHEET      = "Freezed prices"
+EQUITIES_SHEET    = "Equities"
+TICKER_ROW        = 3       # ligne des tickers Yahoo (C3, D3, E3 …)
+GOOGLE_TICKER_ROW = 4       # ligne des tickers Google (C4, D4, E4 …)
+TICKER_COL_START  = 3       # colonne C = index 3 (1-based)
+DATE_COL          = 2       # colonne B
+DATE_ROW_START    = 6       # première date en B6
+EQUITIES_RANGE    = "E7:E"  # tickers actifs au format Google Finance
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
-
-# ── Table de conversion Google Finance → Yahoo Finance ───────────────────────
-
-EXCHANGE_MAP = {
-    "NASDAQ": "", "NYSE": "", "NYSEARCA": "", "NYSEAMERICAN": "",
-    "BATS": "", "OTC": "",
-    "EPA": ".PA", "AMS": ".AS", "EBR": ".BR", "ELI": ".LS",
-    "ETR": ".DE", "FRA": ".F",
-    "LON": ".L",
-    "BIT": ".MI", "MIL": ".MI",
-    "BME": ".MC",
-    "VIE": ".VI",
-    "STO": ".ST", "CPH": ".CO", "HEL": ".HE", "OSL": ".OL",
-    "SWX": ".SW",
-    "WSE": ".WA", "PRA": ".PR", "BUD": ".BD",
-    "TSX": ".TO", "TSXV": ".V", "CVE": ".CN",
-    "TYO": ".T", "OSA": ".OS",
-    "SHA": ".SS", "SHE": ".SZ",
-    "HKG": ".HK",
-    "TPE": ".TW",
-    "NSE": ".NS", "BSE": ".BO", "BOM": ".BO",
-    "SGX": ".SI",
-    "KRX": ".KS", "KOSDAQ": ".KQ",
-    "ASX": ".AX", "NZX": ".NZ",
-    "JSE": ".JO",
-    "BVMF": ".SA",
-    "TLV": ".TA",
-    "IST": ".IS",
-    "MCX": ".ME",
-}
-
-def to_yahoo(raw: str) -> str:
-    """
-    Convertit un ticker Google Finance en ticker Yahoo Finance.
-    'EPA:MC' → 'MC.PA' | 'NASDAQ:AAPL' → 'AAPL' | 'TYO:285A' → '285A.T'
-    Si déjà au format Yahoo (pas de ':'), retourné tel quel.
-    Exchange inconnu → symbole brut tenté quand même.
-    """
-    raw = raw.strip()
-    if ":" not in raw:
-        return raw
-    exchange, symbol = raw.split(":", 1)
-    suffix = EXCHANGE_MAP.get(exchange.upper())
-    if suffix is None:
-        log.warning("Exchange inconnu '%s' — symbole '%s' utilisé tel quel", exchange, symbol)
-        return symbol
-    return symbol + suffix
 
 # ── Authentification ─────────────────────────────────────────────────────────
 
@@ -96,38 +52,44 @@ def get_client() -> gspread.Client:
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
-# ── Lecture des tickers actifs dans Equities ─────────────────────────────────
+# ── Lecture des tickers actifs dans Equities (format Google brut) ─────────────
 
 def read_active_tickers(spreadsheet: gspread.Spreadsheet) -> set[str]:
-    """Lit Equities!E7:E (format Google) et convertit en Yahoo."""
+    """Lit Equities!E7:E et retourne les valeurs brutes, sans conversion."""
     ws = spreadsheet.worksheet(EQUITIES_SHEET)
     values = ws.get(EQUITIES_RANGE)
     result = set()
     for row in values:
         if row and row[0].strip():
-            result.add(to_yahoo(row[0].strip()))
-    log.info("Tickers actifs (format Yahoo) : %d", len(result))
+            result.add(row[0].strip())
+    log.info("Tickers actifs (format Google brut) : %d", len(result))
     return result
 
 # ── Lecture de la feuille Freezed prices ─────────────────────────────────────
 
-def read_prices_sheet(ws: gspread.Worksheet) -> tuple[dict, dict]:
+def read_prices_sheet(ws: gspread.Worksheet) -> tuple[dict, dict, dict]:
     """
     Retourne :
-      ticker_to_col : { 'AAPL': 5, 'MC.PA': 7, … }   index colonne 1-based
-      date_to_row   : { '10/04/2026': 1795, … }        index ligne  1-based
+      ticker_to_col  : { 'FQT.VI': 5, 'BRK-B': 7, … }   Yahoo → colonne
+      date_to_row    : { '10/04/2026': 1795, … }           date  → ligne
+      google_to_yahoo: { 'ETR:FQT': 'FQT.VI', … }         Google → Yahoo
     """
     all_values = ws.get_all_values()
 
-    # Tickers Yahoo en ligne 3, à partir de la colonne C
-    ticker_row = all_values[TICKER_ROW - 1] if len(all_values) >= TICKER_ROW else []
-    ticker_to_col = {
-        cell.strip(): col_idx
-        for col_idx, cell in enumerate(ticker_row, start=1)
-        if col_idx >= TICKER_COL_START and cell.strip()
-    }
+    yahoo_row  = all_values[TICKER_ROW - 1]        if len(all_values) >= TICKER_ROW        else []
+    google_row = all_values[GOOGLE_TICKER_ROW - 1] if len(all_values) >= GOOGLE_TICKER_ROW else []
 
-    # Dates en colonne B, à partir de la ligne 6
+    ticker_to_col   = {}
+    google_to_yahoo = {}
+
+    for col_idx, yahoo in enumerate(yahoo_row, start=1):
+        if col_idx >= TICKER_COL_START and yahoo.strip():
+            ticker_to_col[yahoo.strip()] = col_idx
+            # ticker Google correspondant (même colonne, ligne 4)
+            google = google_row[col_idx - 1].strip() if col_idx - 1 < len(google_row) else ""
+            if google:
+                google_to_yahoo[google] = yahoo.strip()
+
     date_to_row = {
         row[DATE_COL - 1].strip(): row_idx
         for row_idx, row in enumerate(all_values, start=1)
@@ -138,7 +100,7 @@ def read_prices_sheet(ws: gspread.Worksheet) -> tuple[dict, dict]:
 
     log.info("Tickers dans Freezed prices : %d", len(ticker_to_col))
     log.info("Dates dans Freezed prices   : %d", len(date_to_row))
-    return ticker_to_col, date_to_row
+    return ticker_to_col, date_to_row, google_to_yahoo
 
 # ── Date du jour ─────────────────────────────────────────────────────────────
 
@@ -149,9 +111,8 @@ def today_str() -> str:
 
 def fetch_close(ticker: str) -> float | None:
     """
-    Utilise yf.Ticker().history() qui retourne un DataFrame simple
-    sans MultiIndex — compatible avec toutes les versions récentes de yfinance.
-    Période de 5 jours pour couvrir week-ends et jours fériés.
+    Utilise yf.Ticker().history() — période de 5 jours pour couvrir
+    week-ends et jours fériés. Retourne le dernier prix connu.
     """
     try:
         hist = yf.Ticker(ticker).history(period="5d")
@@ -168,10 +129,10 @@ def fetch_close(ticker: str) -> float | None:
 
 def process_spreadsheet(client: gspread.Client, sheet_id: str) -> None:
     log.info("═══ Sheet %s ═══", sheet_id)
-    spreadsheet    = client.open_by_key(sheet_id)
-    active         = read_active_tickers(spreadsheet)
-    ws             = spreadsheet.worksheet(PRICES_SHEET)
-    ticker_to_col, date_to_row = read_prices_sheet(ws)
+    spreadsheet = client.open_by_key(sheet_id)
+    active      = read_active_tickers(spreadsheet)           # tickers Google bruts d'Equities
+    ws          = spreadsheet.worksheet(PRICES_SHEET)
+    ticker_to_col, date_to_row, google_to_yahoo = read_prices_sheet(ws)
 
     today = today_str()
     if today not in date_to_row:
@@ -181,11 +142,20 @@ def process_spreadsheet(client: gspread.Client, sheet_id: str) -> None:
     target_row = date_to_row[today]
     log.info("Ligne cible : %d  (date : %s)", target_row, today)
 
-    # Tickers à traiter = actifs ET présents dans Freezed prices
-    to_process = active & set(ticker_to_col.keys())
-    ignored    = active - set(ticker_to_col.keys())
+    # Tickers Yahoo à traiter = ceux dont le ticker Google est dans Equities
+    to_process = {
+        yahoo
+        for google, yahoo in google_to_yahoo.items()
+        if google in active
+    }
+
+    ignored = {
+        yahoo
+        for google, yahoo in google_to_yahoo.items()
+        if google not in active
+    }
     if ignored:
-        log.info("Ignorés (absents de Freezed prices) : %s", ", ".join(sorted(ignored)))
+        log.info("Ignorés (Google ticker absent d'Equities) : %s", ", ".join(sorted(ignored)))
 
     updates = []
     for ticker in sorted(to_process):
