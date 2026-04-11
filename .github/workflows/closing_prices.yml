@@ -3,7 +3,7 @@ name: Closing Prices
 on:
   schedule:
     # 21h UTC = 23h Paris (été) / 22h Paris (hiver) — après la clôture de toutes les places
-    - cron: "0 21 * * 1-5"
+    - cron: "0 21 * * *"
   workflow_dispatch:
 
 jobs:
