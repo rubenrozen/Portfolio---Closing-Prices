@@ -2,8 +2,9 @@ name: Closing Prices
 
 on:
   schedule:
-    # 22h UTC — après la clôture de toutes les places
-    - cron: "0 22 * * *"
+    # 23h UTC — après la clôture NYSE (même en EST/hiver) et bien avant
+    # l'ouverture de Tokyo (00h UTC), pour éviter les bougies partielles.
+    - cron: "0 23 * * *"
   workflow_dispatch:
 
 jobs:
