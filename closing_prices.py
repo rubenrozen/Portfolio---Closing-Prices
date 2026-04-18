@@ -15,6 +15,9 @@ Comportement :
      ticker (week-end, férié local…), le dernier cours connu est aussi
      propagé sur les lignes des jours non-ouvrés jusqu'à aujourd'hui.
      Garde-fou : pas de fill si l'écart dépasse MAX_FILL_DAYS jours.
+  3. Fill-only : une cellule déjà remplie n'est JAMAIS écrasée. Ça permet
+     de relancer le script sans risque, et de chaîner plusieurs passes
+     pour boucher d'éventuels trous liés à des glitchs Yahoo.
 
 Filtre : seuls les tickers dont le ticker Google (ligne 4) est présent
 dans Equities!E7:E sont traités.
@@ -76,12 +79,13 @@ def read_active_tickers(spreadsheet: gspread.Spreadsheet) -> set[str]:
 
 # ── Lecture de la feuille Freezed prices ─────────────────────────────────────
 
-def read_prices_sheet(ws: gspread.Worksheet) -> tuple[dict, dict, dict]:
+def read_prices_sheet(ws: gspread.Worksheet) -> tuple[dict, dict, dict, set]:
     """
     Retourne :
-      ticker_to_col  : { 'FQT.VI': 5, 'BRK-B': 7, … }   Yahoo → colonne
-      date_to_row    : { '10/04/2026': 1795, … }        date  → ligne
-      google_to_yahoo: { 'ETR:FQT': 'FQT.VI', … }       Google → Yahoo
+      ticker_to_col  : { 'FQT.VI': 5, 'BRK-B': 7, … }    Yahoo → colonne
+      date_to_row    : { '10/04/2026': 1795, … }         date  → ligne
+      google_to_yahoo: { 'ETR:FQT': 'FQT.VI', … }        Google → Yahoo
+      filled_cells   : { (1795, 5), (1795, 7), … }       cellules NON VIDES
     """
     all_values = ws.get_all_values()
 
@@ -106,9 +110,20 @@ def read_prices_sheet(ws: gspread.Worksheet) -> tuple[dict, dict, dict]:
         and row[DATE_COL - 1].strip()
     }
 
+    # Cellules déjà remplies dans la zone des prix (ligne ≥ DATE_ROW_START,
+    # colonne ≥ TICKER_COL_START). Utilisées pour le mode fill-only.
+    filled_cells = set()
+    for row_idx, row in enumerate(all_values, start=1):
+        if row_idx < DATE_ROW_START:
+            continue
+        for col_idx, val in enumerate(row, start=1):
+            if col_idx >= TICKER_COL_START and val.strip():
+                filled_cells.add((row_idx, col_idx))
+
     log.info("Tickers dans Freezed prices : %d", len(ticker_to_col))
     log.info("Dates dans Freezed prices   : %d", len(date_to_row))
-    return ticker_to_col, date_to_row, google_to_yahoo
+    log.info("Cellules déjà remplies      : %d", len(filled_cells))
+    return ticker_to_col, date_to_row, google_to_yahoo, filled_cells
 
 # ── Fetch du prix ET de la date de clôture ───────────────────────────────────
 
@@ -178,7 +193,7 @@ def process_spreadsheet(client: gspread.Client, sheet_id: str) -> None:
     spreadsheet = client.open_by_key(sheet_id)
     active      = read_active_tickers(spreadsheet)
     ws          = spreadsheet.worksheet(PRICES_SHEET)
-    ticker_to_col, date_to_row, google_to_yahoo = read_prices_sheet(ws)
+    ticker_to_col, date_to_row, google_to_yahoo, filled_cells = read_prices_sheet(ws)
 
     today = today_str()
     log.info("Date d'exécution : %s", today)
@@ -198,7 +213,9 @@ def process_spreadsheet(client: gspread.Client, sheet_id: str) -> None:
     if ignored:
         log.info("Ignorés (Google ticker absent d'Equities) : %s", ", ".join(sorted(ignored)))
 
-    updates = []
+    updates      = []
+    skipped_full = 0   # compteur de cellules skippées car déjà remplies
+
     for ticker in sorted(to_process):
         result = fetch_close(ticker)
         if result is None:
@@ -210,20 +227,37 @@ def process_spreadsheet(client: gspread.Client, sheet_id: str) -> None:
             log.info("  %s : date cours %s absente — rien à écrire", ticker, price_date)
             continue
 
-        col = ticker_to_col[ticker]
+        col              = ticker_to_col[ticker]
+        written_dates    = []
+        skipped_dates    = []
+
         for date_str in fills:
             target_row = date_to_row[date_str]
+            cell_pos   = (target_row, col)
+            if cell_pos in filled_cells:
+                skipped_dates.append(date_str)
+                skipped_full += 1
+                continue
             cell = gspread.utils.rowcol_to_a1(target_row, col)
             updates.append({"range": cell, "values": [[price]]})
+            written_dates.append(date_str)
 
-        extra = "" if len(fills) == 1 else f"  (fill sur {len(fills)} jours : {', '.join(fills)})"
-        log.info("  ✓ %-15s = %s  [cours du %s]%s", ticker, price, price_date, extra)
+        if written_dates:
+            extra = ""
+            if len(written_dates) > 1:
+                extra = f"  (fill sur {len(written_dates)} jours : {', '.join(written_dates)})"
+            if skipped_dates:
+                extra += f"  [déjà rempli : {', '.join(skipped_dates)}]"
+            log.info("  ✓ %-15s = %s  [cours du %s]%s", ticker, price, price_date, extra)
+        elif skipped_dates:
+            log.info("  = %-15s  déjà rempli sur %s", ticker, ", ".join(skipped_dates))
 
     if updates:
         ws.batch_update(updates)
-        log.info("✓ %d cellules écrites", len(updates))
+        log.info("✓ %d cellules écrites (%d cellules déjà remplies ignorées)",
+                 len(updates), skipped_full)
     else:
-        log.info("Aucun prix à écrire.")
+        log.info("Aucun prix à écrire (%d cellules déjà remplies ignorées).", skipped_full)
 
 # ── Point d'entrée ────────────────────────────────────────────────────────────
 
