@@ -11,7 +11,9 @@ jobs:
   run:
     name: Fetch & write closing prices
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # 2 passes + 15 min de sleep → large marge
+    timeout-minutes: 45   # 2 passes (~5 min chacune avec sleep 0.3s entre
+                          # tickers + retry NaN + fallback intraday) + 15 min
+                          # de sleep inter-passes → ~27 min estimé, marge large.
 
     steps:
       - name: Checkout repo
