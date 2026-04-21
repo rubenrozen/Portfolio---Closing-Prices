@@ -19,6 +19,17 @@ Comportement :
      de relancer le script sans risque, et de chaîner plusieurs passes
      pour boucher d'éventuels trous liés à des glitchs Yahoo.
 
+Robustesse fetch (cascade de fallbacks pour gérer rate limit + NaN Yahoo) :
+  a) Clôture daily du jour → si valide, on prend.
+  b) Si réponse vide ou Close NaN → retry après 2-3s (souvent rate limit
+     qui se relâche).
+  c) Si toujours NaN → fallback intraday (dernier tick 5min du jour).
+  d) Filet de sécurité ultime → dernière clôture valide dans l'historique.
+
+Entre chaque ticker : sleep(0.3) pour rester à ~60 req/min et éviter le
+rate limiting Yahoo (qui se manifeste par des NaN ou des réponses vides
+en heures de pointe, typiquement à 23h UTC).
+
 Filtre : seuls les tickers dont le ticker Google (ligne 4) est présent
 dans Equities!E7:E sont traités.
 
@@ -29,6 +40,8 @@ Secrets GitHub requis :
 
 import os
 import json
+import math
+import time
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -51,6 +64,11 @@ DATE_ROW_START    = 6       # première date en B6
 EQUITIES_RANGE    = "E7:E"  # tickers actifs au format Google Finance
 DATE_FMT          = "%d/%m/%Y"
 MAX_FILL_DAYS     = 7       # garde-fou : pas de forward-fill au-delà
+
+# Rate limiting & retry
+INTER_TICKER_SLEEP = 0.3    # délai entre tickers (≈ 60 req/min max)
+RETRY_SLEEP_EMPTY  = 3      # sleep avant retry si réponse Yahoo vide
+RETRY_SLEEP_NAN    = 2      # sleep avant retry si Close NaN
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -125,22 +143,74 @@ def read_prices_sheet(ws: gspread.Worksheet) -> tuple[dict, dict, dict, set]:
     log.info("Cellules déjà remplies      : %d", len(filled_cells))
     return ticker_to_col, date_to_row, google_to_yahoo, filled_cells
 
-# ── Fetch du prix ET de la date de clôture ───────────────────────────────────
+# ── Fetch du prix avec cascade de fallbacks ──────────────────────────────────
 
 def fetch_close(ticker: str) -> tuple[str, float] | None:
     """
-    Retourne (date 'DD/MM/YYYY', prix) du dernier jour de cotation connu.
+    Retourne (date 'DD/MM/YYYY', prix) selon une cascade de fallbacks :
+      1) clôture daily du jour (si non-NaN)
+      2) retry après sleep court (rattrape rate limit ponctuel)
+      3) fallback intraday (dernier tick 5min du jour)
+      4) filet de sécurité : dernière clôture valide dans l'historique
+
     La date renvoyée est celle fournie par Yahoo dans la timezone du marché,
     donc la date réelle du cours — pas la date d'exécution du script.
     """
     try:
-        hist = yf.Ticker(ticker).history(period="5d")
+        yf_ticker = yf.Ticker(ticker)
+        hist = yf_ticker.history(period="5d")
+
+        # Retry si réponse totalement vide (souvent rate limit)
         if hist.empty:
-            log.info("  %s : aucune donnée retournée par Yahoo", ticker)
-            return None
-        last_date = hist.index[-1].strftime(DATE_FMT)
-        price     = round(float(hist["Close"].iloc[-1]), 4)
-        return last_date, price
+            log.info("  %s : réponse vide Yahoo → retry dans %ds", ticker, RETRY_SLEEP_EMPTY)
+            time.sleep(RETRY_SLEEP_EMPTY)
+            hist = yf_ticker.history(period="5d")
+            if hist.empty:
+                log.info("  %s : toujours vide après retry — ignoré", ticker)
+                return None
+
+        # ── Tentative 1 : clôture daily du jour, si valide ──────────────
+        last_close = hist["Close"].iloc[-1]
+        if not math.isnan(last_close):
+            last_date = hist.index[-1].strftime(DATE_FMT)
+            return last_date, round(float(last_close), 4)
+
+        # ── Tentative 2 : retry sur NaN (rate limit qui se relâche) ──────
+        last_daily_date = hist.index[-1].strftime(DATE_FMT)
+        log.info("  %s : Close NaN pour %s → retry dans %ds", ticker, last_daily_date, RETRY_SLEEP_NAN)
+        time.sleep(RETRY_SLEEP_NAN)
+        hist_retry = yf_ticker.history(period="5d")
+        if not hist_retry.empty:
+            last_close_retry = hist_retry["Close"].iloc[-1]
+            if not math.isnan(last_close_retry):
+                last_date = hist_retry.index[-1].strftime(DATE_FMT)
+                log.info("  %s : retry OK → clôture récupérée", ticker)
+                return last_date, round(float(last_close_retry), 4)
+            hist = hist_retry  # utilise la version la plus fraîche pour la suite
+
+        # ── Tentative 3 : fallback intraday (dernier tick 5min) ──────────
+        log.info("  %s : retry NaN → fallback intraday", ticker)
+        try:
+            intraday = yf_ticker.history(period="1d", interval="5m")
+            intraday = intraday.dropna(subset=["Close"])
+            if not intraday.empty:
+                price = round(float(intraday["Close"].iloc[-1]), 4)
+                log.info("  %s : fallback intraday OK → %s", ticker, price)
+                return last_daily_date, price
+        except Exception as e:
+            log.warning("  %s : intraday KO → %s", ticker, e)
+
+        # ── Tentative 4 : dernière clôture valide (même si ancienne) ─────
+        valid_hist = hist.dropna(subset=["Close"])
+        if not valid_hist.empty:
+            last_date = valid_hist.index[-1].strftime(DATE_FMT)
+            price = round(float(valid_hist["Close"].iloc[-1]), 4)
+            log.info("  %s : fallback dernière clôture valide (%s) → %s", ticker, last_date, price)
+            return last_date, price
+
+        log.info("  %s : aucune donnée exploitable", ticker)
+        return None
+
     except Exception as exc:
         log.warning("  %s : erreur fetch → %s", ticker, exc)
         return None
@@ -218,9 +288,16 @@ def process_spreadsheet(client: gspread.Client, sheet_id: str) -> None:
 
     for ticker in sorted(to_process):
         result = fetch_close(ticker)
+        time.sleep(INTER_TICKER_SLEEP)   # rate limit safety
         if result is None:
             continue
         price_date, price = result
+
+        # Garde-fou ultime : ne jamais pousser un NaN à Google Sheets
+        # (le JSON n'accepte pas NaN et tout le batch se fait rejeter)
+        if math.isnan(price):
+            log.warning("  %s : prix NaN après tous les fallbacks — skip", ticker)
+            continue
 
         fills = dates_to_fill(price_date, today, date_to_row)
         if not fills:
